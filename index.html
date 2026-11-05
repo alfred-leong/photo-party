@@ -161,7 +161,7 @@ function hostMode(){
         if (running && !shown.has(msg.guestId) && !queue.slice(idx).includes(msg.guestId)) {
           const pos = idx + 1 + Math.floor(Math.random() * (queue.length - idx));
           queue.splice(Math.min(pos, queue.length), 0, msg.guestId);
-          if (!$("done").classList.contains("hidden")) { $("done").classList.add("hidden"); showNext(); }
+          if (!$("done").classList.contains("hidden")) { $("done").classList.add("hidden"); showAt(queue.indexOf(msg.guestId)); }
         }
         refreshLobby(); updateProgress();
         conn.send({ type: "ack", replaced: !!prev });
