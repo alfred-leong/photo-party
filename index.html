@@ -4,9 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Photo Party</title>
-<script src="https://cdn.jsdelivr.net/npm/peerjs@1.5.4/dist/peerjs.min.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/qrcodejs@1.0.0/qrcode.min.js"></script>
-<script src="https://cdn.jsdelivr.net/npm/mqtt@5.10.1/dist/mqtt.min.js"></script>
 <style>
   :root { --bg:#111014; --fg:#f5f2ea; --muted:#9a95a3; --accent:#ffb347; --card:#1d1b22; }
   * { box-sizing:border-box; }
@@ -74,6 +72,7 @@
   <div id="thumbs"></div>
   <div class="row">
     <button id="startBtn" disabled>Start</button>
+    <button id="newRoomBtn" class="ghost">New room</button>
   </div>
   <div id="status">Connecting…</div>
 </section>
@@ -118,21 +117,26 @@
 </section>
 
 <script>
+/*
+ * Transport: ntfy.sh (free, no account, plain HTTPS).
+ *  - Guest encrypts photo (AES-GCM, key from the QR link) and PUTs it as an attachment to topic.
+ *  - Screen listens on the topic (live stream + slow poll as a safety net), downloads, decrypts.
+ *  - ntfy.sh keeps attachments ~3 hours, so reloading the screen recovers photos.
+ */
 const SECONDS = 30;
-const PREFIX = "photoparty-";
+const NTFY = "https://ntfy.sh";
 const params = new URLSearchParams(location.search);
 const joinId = params.get("join");
 const $ = id => document.getElementById(id);
 const store = {
   get(k){ try { return localStorage.getItem(k); } catch(e){ return null; } },
-  set(k,v){ try { localStorage.setItem(k,v); } catch(e){} }
+  set(k,v){ try { localStorage.setItem(k,v); } catch(e){} },
+  del(k){ try { localStorage.removeItem(k); } catch(e){} }
 };
 const rid = n => Array.from(crypto.getRandomValues(new Uint8Array(n)), b => "abcdefghjkmnpqrstuvwxyz23456789"[b%31]).join("");
+const topicFor = room => "photoparty-v2-" + room;
+const sleep = ms => new Promise(r => setTimeout(r, ms));
 
-// ---- relay helpers (public MQTT brokers; payloads are AES-GCM encrypted with the room key from the QR) ----
-const BROKERS = ["wss://broker.emqx.io:8084/mqtt", "wss://broker.hivemq.com:8884/mqtt"];
-const topicUp  = room => "photoparty-v1/" + room + "/up";
-const topicAck = (room, id) => "photoparty-v1/" + room + "/ack/" + id;
 async function aesKey(secret){
   const h = await crypto.subtle.digest("SHA-256", new TextEncoder().encode("photoparty:" + secret));
   return crypto.subtle.importKey("raw", h, "AES-GCM", false, ["encrypt","decrypt"]);
@@ -143,113 +147,96 @@ async function encrypt(secret, bytes){
   const out = new Uint8Array(12 + ct.length); out.set(iv); out.set(ct, 12); return out;
 }
 async function decrypt(secret, sealed){
-  const pt = await crypto.subtle.decrypt({ name:"AES-GCM", iv: sealed.subarray(0,12) }, await aesKey(secret), sealed.subarray(12));
-  return new Uint8Array(pt);
+  return new Uint8Array(await crypto.subtle.decrypt({ name:"AES-GCM", iv: sealed.subarray(0,12) }, await aesKey(secret), sealed.subarray(12)));
 }
-function bytesToB64(u8){ let s = ""; for (let i = 0; i < u8.length; i += 0x8000) s += String.fromCharCode.apply(null, u8.subarray(i, i + 0x8000)); return btoa(s); }
-function b64ToBytes(b){ const s = atob(b); const u = new Uint8Array(s.length); for (let i = 0; i < s.length; i++) u[i] = s.charCodeAt(i); return u; }
 
 joinId ? guestMode(joinId) : hostMode();
 
 /* ===================== HOST ===================== */
 function hostMode(){
   $("lobby").classList.remove("hidden");
-  // Keep the same room id across reloads so the QR stays valid.
-  let roomId = store.get("pp-room");
-  if (!roomId) { roomId = rid(8); store.set("pp-room", roomId); }
+  // Keep the same room across reloads so the QR stays valid and photos come back.
+  let roomId = store.get("pp-room"), roomKey = store.get("pp-key");
+  if (!roomId || !roomKey) { roomId = rid(12); roomKey = rid(20); store.set("pp-room", roomId); store.set("pp-key", roomKey); }
+  const topic = topicFor(roomId);
 
   const photos = new Map();      // guestId -> {url, name}
+  const seen = new Set();        // ntfy message ids already handled
   let queue = [], shown = new Set(), idx = 0;
   let current = null, remaining = SECONDS, tick = null, paused = false, running = false;
-  let wakeLock = null;
-
-  let roomKey = store.get("pp-key");
-  if (!roomKey) { roomKey = rid(20); store.set("pp-key", roomKey); }
 
   const base = location.href.split("?")[0].split("#")[0];
   const joinUrl = base + "?join=" + roomId + "&k=" + roomKey;
   new QRCode($("qr"), { text: joinUrl, width: 512, height: 512, correctLevel: QRCode.CorrectLevel.M });
 
-  // Status line: one entry per route.
-  const routes = { direct: "connecting", relay: "connecting" };
+  let live = false, lastOk = 0;
   function renderStatus(){
-    const ok = Object.values(routes).filter(v => v === "ok").length;
-    $("status").textContent = (ok ? "Ready" : "Connecting…") + " · room " + roomId +
-      " · direct " + (routes.direct === "ok" ? "✓" : "…") + " · relay " + (routes.relay === "ok" ? "✓" : "…");
+    const fresh = live || Date.now() - lastOk < 45000;
+    $("status").textContent = (fresh ? "Ready" : "Connecting…") + " · room " + roomId.slice(0,6);
   }
-  renderStatus();
+  renderStatus(); setInterval(renderStatus, 5000);
 
   function receivePhoto(guestId, name, mime, bytes){
-    const blob = new Blob([bytes], { type: mime || "image/jpeg" });
     const prev = photos.get(guestId);
     if (prev) URL.revokeObjectURL(prev.url);
-    photos.set(guestId, { url: URL.createObjectURL(blob), name: (name||"").slice(0,40) });
-    // If the show is running and this is a new/replaced photo not yet shown, queue it.
+    photos.set(guestId, { url: URL.createObjectURL(new Blob([bytes], { type: mime || "image/jpeg" })), name: (name||"").slice(0,40) });
     if (running && !shown.has(guestId) && !queue.slice(idx).includes(guestId)) {
       const pos = idx + 1 + Math.floor(Math.random() * (queue.length - idx));
       queue.splice(Math.min(pos, queue.length), 0, guestId);
       if (!$("done").classList.contains("hidden")) { $("done").classList.add("hidden"); showAt(queue.indexOf(guestId)); }
     }
     refreshLobby(); updateProgress();
-    return !!prev;
   }
 
-  // ---- Route 1: direct (PeerJS / WebRTC) ----
-  let peer;
-  function connect(){
-    peer = new Peer(PREFIX + roomId);
-    peer.on("open", () => { routes.direct = "ok"; renderStatus(); });
-    peer.on("connection", conn => {
-      conn.on("data", msg => {
-        if (!msg || msg.type !== "photo" || !msg.data) return;
-        const replaced = receivePhoto(msg.guestId, msg.name, msg.mime, msg.data);
-        conn.send({ type: "ack", replaced });
-      });
-    });
-    peer.on("disconnected", () => { routes.direct = "down"; renderStatus(); setTimeout(() => { try { peer.reconnect(); } catch(e){} }, 1000); });
-    peer.on("error", err => {
-      if (err.type === "peer-unavailable") return;          // irrelevant on host
-      routes.direct = "down"; renderStatus();
-      const wait = err.type === "unavailable-id" ? 4000 : 3000;  // old tab may still hold the id
-      setTimeout(() => { try { peer.destroy(); } catch(e){} connect(); }, wait);
-    });
+  // Handle one ntfy message (from stream or poll). Messages arrive oldest-first.
+  const pending = [];   // serialize so a guest's newer photo always wins over an older one
+  let working = false;
+  function handle(m){
+    if (!m || m.event !== "message" || !m.attachment || seen.has(m.id)) return;
+    seen.add(m.id); pending.push(m); pump();
   }
-  try { connect(); } catch(e) { routes.direct = "down"; renderStatus(); }
+  async function pump(){
+    if (working) return; working = true;
+    while (pending.length) {
+      const m = pending.shift();
+      for (let attempt = 0; attempt < 3; attempt++) {
+        try {
+          const sealed = new Uint8Array(await fetch(m.attachment.url).then(r => { if (!r.ok) throw new Error(r.status); return r.arrayBuffer(); }));
+          const plain = await decrypt(roomKey, sealed);
+          const hlen = new DataView(plain.buffer, plain.byteOffset).getUint32(0);
+          const head = JSON.parse(new TextDecoder().decode(plain.subarray(4, 4 + hlen)));
+          receivePhoto(head.guestId, head.name, head.mime, plain.slice(4 + hlen));
+          break;
+        } catch(e) {
+          if (e && e.name === "OperationError") break;   // wrong key / not ours: ignore
+          if (String(e.message) === "404") break;        // expired attachment
+          await sleep(1500 * (attempt + 1));
+        }
+      }
+    }
+    working = false;
+  }
 
-  // ---- Route 2: relay (MQTT over WebSocket, end-to-end encrypted with roomKey) ----
-  const partial = new Map();   // msgId -> {n, parts: []}
-  const relayUp = new Set();
-  BROKERS.forEach(url => {
-    if (!window.mqtt) return;
-    const client = mqtt.connect(url, { clientId: "pph-" + rid(10), clean: true, connectTimeout: 8000, reconnectPeriod: 3000, keepalive: 30 });
-    client.on("connect", () => {
-      client.subscribe(topicUp(roomId), { qos: 1 });
-      relayUp.add(url); routes.relay = "ok"; renderStatus();
-    });
-    client.on("close", () => {
-      relayUp.delete(url); routes.relay = relayUp.size ? "ok" : "down"; renderStatus();
-    });
-    client.on("message", async (topic, payload) => {
-      try {
-        const m = JSON.parse(new TextDecoder().decode(payload));
-        if (!m.id || typeof m.i !== "number") return;
-        let e = partial.get(m.id);
-        if (!e) { e = { n: m.n, parts: new Array(m.n), got: 0, t: Date.now() }; partial.set(m.id, e); }
-        if (e.parts[m.i] === undefined) { e.parts[m.i] = m.d; e.got++; }
-        if (e.got < e.n) return;
-        partial.delete(m.id);
-        const sealed = b64ToBytes(e.parts.join(""));
-        const plain = await decrypt(roomKey, sealed);
-        const hlen = new DataView(plain.buffer, plain.byteOffset).getUint32(0);
-        const head = JSON.parse(new TextDecoder().decode(plain.subarray(4, 4 + hlen)));
-        const img = plain.slice(4 + hlen);
-        const replaced = receivePhoto(head.guestId, head.name, head.mime, img);
-        client.publish(topicAck(roomId, m.id), replaced ? "r" : "n", { qos: 1 });
-      } catch(err) { console.warn("relay message dropped", err); }
-    });
-    // Drop half-received uploads after 2 minutes.
-    setInterval(() => { const now = Date.now(); for (const [k,v] of partial) if (now - v.t > 120000) partial.delete(k); }, 30000);
-  });
+  // Live stream (one long request; reconnects itself and resumes from the last id).
+  function openStream(){
+    let es;
+    try { es = new EventSource(NTFY + "/" + topic + "/sse?since=all"); } catch(e) { return; }
+    es.onopen = () => { live = true; lastOk = Date.now(); renderStatus(); };
+    es.onmessage = e => { lastOk = Date.now(); try { handle(JSON.parse(e.data)); } catch(_){} };
+    es.onerror = () => { live = false; renderStatus(); };
+  }
+  openStream();
+
+  // Safety net: slow poll (kept slow to stay well inside ntfy.sh's free rate limits).
+  async function poll(){
+    try {
+      const txt = await fetch(NTFY + "/" + topic + "/json?poll=1&since=all").then(r => { if (!r.ok) throw 0; return r.text(); });
+      lastOk = Date.now();
+      txt.split("\n").filter(Boolean).forEach(l => { try { handle(JSON.parse(l)); } catch(_){} });
+    } catch(e) {}
+    renderStatus();
+  }
+  poll(); setInterval(poll, 20000);
 
   function refreshLobby(){
     $("count").innerHTML = "<b>" + photos.size + "</b> photo" + (photos.size===1?"":"s") + " in";
@@ -269,7 +256,7 @@ function hostMode(){
     requestWake();
   }
   function requestWake(){
-    try { navigator.wakeLock?.request("screen").then(l => { wakeLock = l; }).catch(() => {}); } catch(e){}
+    try { navigator.wakeLock?.request("screen").catch(() => {}); } catch(e){}
   }
 
   function startShow(){
@@ -281,7 +268,6 @@ function hostMode(){
 
   function showAt(i){
     clearInterval(tick);
-    // skip any entries whose photo has gone missing
     while (i < queue.length && !photos.has(queue[i])) i++;
     idx = i;
     if (idx >= queue.length) { $("done").classList.remove("hidden"); return; }
@@ -310,25 +296,32 @@ function hostMode(){
     $("progress").textContent = Math.min(idx + 1, queue.length) + " / " + queue.length;
   }
 
-  $("startBtn").onclick = () => { enterShow(); if (!running) startShow(); else { paused = false; $("pauseBtn").textContent="Pause"; } };
+  $("startBtn").onclick = () => { enterShow(); if (!running) startShow(); else { paused = false; $("pauseBtn").textContent = "Pause"; } };
   $("nextBtn").onclick = () => showNext();
   $("pauseBtn").onclick = () => { paused = !paused; $("pauseBtn").textContent = paused ? "Resume" : "Pause"; };
-  $("lobbyBtn").onclick = () => { paused = true; $("pauseBtn").textContent="Resume"; $("show").classList.add("hidden"); $("lobby").classList.remove("hidden"); refreshLobby(); };
+  $("lobbyBtn").onclick = () => { paused = true; $("pauseBtn").textContent = "Resume"; $("show").classList.add("hidden"); $("lobby").classList.remove("hidden"); refreshLobby(); };
   $("againBtn").onclick = () => startShow();
   $("backBtn").onclick = () => { running = false; clearInterval(tick); $("show").classList.add("hidden"); $("lobby").classList.remove("hidden"); refreshLobby(); };
+  let confirmNew = false;
+  $("newRoomBtn").onclick = () => {
+    if (!confirmNew) { confirmNew = true; $("newRoomBtn").textContent = "Tap again: clears all photos + new QR"; setTimeout(() => { confirmNew = false; $("newRoomBtn").textContent = "New room"; }, 4000); return; }
+    store.del("pp-room"); store.del("pp-key"); location.reload();
+  };
   document.addEventListener("keydown", e => {
     if ($("show").classList.contains("hidden")) return;
     if (e.key === "ArrowRight") showNext();
     if (e.key === " ") $("pauseBtn").click();
   });
   document.addEventListener("visibilitychange", () => {
-    if (document.visibilityState === "visible" && running) requestWake();
+    if (document.visibilityState === "visible") { poll(); if (running) requestWake(); }
   });
 }
 
 /* ===================== GUEST ===================== */
 function guestMode(roomId){
   $("guest").classList.remove("hidden");
+  const roomKey = params.get("k");
+  if (!roomKey) { msg("This link is out of date — please scan the QR code on the screen again.", "err"); return; }
   let guestId = store.get("pp-guest");
   if (!guestId) { guestId = rid(10); store.set("pp-guest", guestId); }
   $("gname").value = store.get("pp-name") || "";
@@ -340,98 +333,48 @@ function guestMode(roomId){
     msg("Preparing…", "");
     try {
       jpeg = await compress(f);
-      const url = URL.createObjectURL(jpeg);
       const fileInput = $("gfile");
       $("pick").replaceChildren(fileInput);
-      const im = new Image(); im.src = url; $("pick").appendChild(im);
+      const im = new Image(); im.src = URL.createObjectURL(jpeg); $("pick").appendChild(im);
       $("sendBtn").disabled = false; msg("", "");
     } catch(err) { msg("Couldn't read that image — try another one.", "err"); }
   };
 
-  const roomKey = params.get("k");
-  const forceRoute = params.get("route");   // debug: "direct" or "relay"
-
   $("sendBtn").onclick = async () => {
     if (!jpeg) return;
-    $("sendBtn").disabled = true; msg("Sending…", "");
+    $("sendBtn").disabled = true; msg("Uploading…", "");
     const name = $("gname").value.trim(); store.set("pp-name", name);
-    const bytes = new Uint8Array(await jpeg.arrayBuffer());
-    const errors = [];
-    let result = null;
-
-    if (forceRoute !== "relay") {
-      try { result = await sendDirect(name, bytes); }
-      catch(e) { errors.push("direct: " + e.message); console.warn(e); }
-    }
-    if (!result && roomKey && forceRoute !== "direct") {
-      msg("Trying another route…", "");
-      try { result = await sendRelay(name, bytes); }
-      catch(e) { errors.push("relay: " + e.message); console.warn(e); }
-    }
-
-    $("sendBtn").disabled = false;
-    if (result) {
+    try {
+      const bytes = new Uint8Array(await jpeg.arrayBuffer());
+      const head = new TextEncoder().encode(JSON.stringify({ guestId, name, mime: "image/jpeg" }));
+      const plain = new Uint8Array(4 + head.length + bytes.length);
+      new DataView(plain.buffer).setUint32(0, head.length); plain.set(head, 4); plain.set(bytes, 4 + head.length);
+      const sealed = await encrypt(roomKey, plain);
+      let lastErr;
+      for (let attempt = 0; attempt < 3; attempt++) {
+        try {
+          const ctrl = new AbortController(); const t = setTimeout(() => ctrl.abort(), 45000);
+          const r = await fetch(NTFY + "/" + topicFor(roomId) + "?filename=photo.bin&message=photo", { method: "PUT", body: sealed, signal: ctrl.signal });
+          clearTimeout(t);
+          if (r.status === 429) throw new Error("busy (too many uploads at once)");
+          if (!r.ok) throw new Error("server said " + r.status);
+          const j = await r.json();
+          if (!j.attachment) throw new Error("upload not stored");
+          lastErr = null; break;
+        } catch(e) {
+          lastErr = e.name === "AbortError" ? new Error("timed out") : e;
+          msg("Retrying…", ""); await sleep(2000 * (attempt + 1));
+        }
+      }
+      if (lastErr) throw lastErr;
       store.set("pp-sent-" + roomId, "1");
-      msg(result.replaced ? "✅ Replaced! Watch the screen." : "✅ Sent! Watch the screen.", "ok");
+      msg("✅ Sent! Watch the screen.", "ok");
       $("sendBtn").textContent = "Replace my photo";
-    } else {
-      const offline = errors.some(e => e.includes("screen-offline"));
-      msg(offline
-        ? "The screen isn't online right now — ask the host to check, then try again."
-        : "Couldn't reach the screen. Try again, or switch between Wi-Fi and mobile data. (" + errors.join("; ") + ")", "err");
+    } catch(e) {
+      msg("Upload failed: " + (e.message || e) + ". Check your internet and try again.", "err");
     }
+    $("sendBtn").disabled = false;
   };
-
-  // Route 1: direct WebRTC via PeerJS. Resolves {replaced} or rejects.
-  function sendDirect(name, bytes){
-    return new Promise((resolve, reject) => {
-      let peer, done = false;
-      const end = (err, val) => { if (done) return; done = true; clearTimeout(t); setTimeout(() => { try { peer && peer.destroy(); } catch(e){} }, 1000); err ? reject(err) : resolve(val); };
-      const t = setTimeout(() => end(new Error("timeout")), 12000);
-      try { peer = new Peer(); } catch(e) { return end(new Error("unavailable")); }
-      peer.on("error", err => end(new Error(err.type === "peer-unavailable" ? "screen-offline" : err.type)));
-      peer.on("open", () => {
-        const conn = peer.connect(PREFIX + roomId, { reliable: true });
-        conn.on("open", () => conn.send({ type: "photo", guestId, name, mime: "image/jpeg", data: bytes.buffer }));
-        conn.on("data", d => { if (d && d.type === "ack") end(null, { replaced: !!d.replaced }); });
-        conn.on("error", () => end(new Error("channel")));
-      });
-    });
-  }
-
-  // Route 2: encrypted upload through a public MQTT relay. Tries each broker in turn.
-  async function sendRelay(name, bytes){
-    if (!window.mqtt) throw new Error("relay library didn't load");
-    const head = new TextEncoder().encode(JSON.stringify({ guestId, name, mime: "image/jpeg" }));
-    const plain = new Uint8Array(4 + head.length + bytes.length);
-    new DataView(plain.buffer).setUint32(0, head.length); plain.set(head, 4); plain.set(bytes, 4 + head.length);
-    const b64 = bytesToB64(await encrypt(roomKey, plain));
-    const CH = 48000, n = Math.ceil(b64.length / CH), id = rid(12);
-    let lastErr = new Error("no relay");
-    for (const url of BROKERS) {
-      try { return await viaBroker(url, id, b64, CH, n); }
-      catch(e) { lastErr = e; }
-    }
-    throw lastErr;
-  }
-  function viaBroker(url, id, b64, CH, n){
-    return new Promise((resolve, reject) => {
-      let done = false;
-      const client = mqtt.connect(url, { clientId: "ppg-" + rid(10), clean: true, connectTimeout: 7000, reconnectPeriod: 0 });
-      const end = (err, val) => { if (done) return; done = true; clearTimeout(t); try { client.end(true); } catch(e){} err ? reject(err) : resolve(val); };
-      const t = setTimeout(() => end(new Error("no answer from screen")), 25000);
-      client.on("error", e => end(new Error("relay error")));
-      client.on("message", (topic, payload) => end(null, { replaced: new TextDecoder().decode(payload) === "r" }));
-      client.on("connect", () => {
-        client.subscribe(topicAck(roomId, id), { qos: 1 }, err => {
-          if (err) return end(new Error("relay subscribe"));
-          for (let i = 0; i < n; i++) {
-            client.publish(topicUp(roomId), JSON.stringify({ id, i, n, d: b64.slice(i*CH, (i+1)*CH) }), { qos: 1 });
-          }
-        });
-      });
-    });
-  }
 
   function msg(t, cls){ $("gmsg").textContent = t; $("gmsg").className = cls; }
 
