@@ -1,0 +1,324 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Photo Party</title>
+<script src="https://cdn.jsdelivr.net/npm/peerjs@1.5.4/dist/peerjs.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/qrcodejs@1.0.0/qrcode.min.js"></script>
+<style>
+  :root { --bg:#111014; --fg:#f5f2ea; --muted:#9a95a3; --accent:#ffb347; --card:#1d1b22; }
+  * { box-sizing:border-box; }
+  html,body { margin:0; height:100%; background:var(--bg); color:var(--fg);
+    font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
+  .hidden { display:none !important; }
+  button { font:inherit; border:0; border-radius:999px; padding:14px 28px; font-weight:700;
+    background:var(--accent); color:#1a1200; cursor:pointer; }
+  button.ghost { background:transparent; color:var(--fg); border:1px solid #444; font-weight:500; }
+  button:disabled { opacity:.4; cursor:default; }
+
+  /* ---------- host lobby ---------- */
+  #lobby { min-height:100%; display:flex; flex-direction:column; align-items:center;
+    justify-content:center; gap:18px; padding:24px; text-align:center; }
+  #lobby h1 { margin:0; font-size:clamp(28px,6vw,52px); letter-spacing:-.02em; }
+  #lobby p { margin:0; color:var(--muted); }
+  #qr { background:#fff; padding:16px; border-radius:18px; }
+  #qr img, #qr canvas { display:block; width:min(62vmin,340px) !important; height:auto !important; }
+  #count { font-size:22px; font-weight:700; }
+  #count b { color:var(--accent); font-size:34px; }
+  #thumbs { display:flex; flex-wrap:wrap; gap:6px; justify-content:center; max-width:560px; }
+  #thumbs img { width:44px; height:44px; object-fit:cover; border-radius:8px; }
+  #status { font-size:13px; color:var(--muted); }
+  .row { display:flex; gap:10px; flex-wrap:wrap; justify-content:center; }
+
+  /* ---------- slideshow ---------- */
+  #show { position:fixed; inset:0; background:#000; }
+  #show img { position:absolute; inset:0; width:100%; height:100%; object-fit:contain; }
+  #bgblur { filter:blur(40px) brightness(.45); object-fit:cover !important; transform:scale(1.1); }
+  #timer { position:absolute; top:16px; right:16px; width:92px; height:92px; }
+  #timer svg { width:100%; height:100%; transform:rotate(-90deg); }
+  #timer .num { position:absolute; inset:0; display:flex; align-items:center; justify-content:center;
+    font-size:34px; font-weight:800; text-shadow:0 2px 8px #000; }
+  #caption { position:absolute; left:16px; bottom:16px; padding:8px 14px; border-radius:999px;
+    background:rgba(0,0,0,.55); font-size:18px; }
+  #progress { position:absolute; left:16px; top:16px; padding:6px 12px; border-radius:999px;
+    background:rgba(0,0,0,.55); font-size:15px; color:#ddd; }
+  #controls { position:absolute; right:16px; bottom:16px; display:flex; gap:8px; opacity:.25; transition:opacity .2s; }
+  #controls:hover, #controls:focus-within { opacity:1; }
+  #controls button { padding:10px 16px; font-size:14px; background:rgba(255,255,255,.15); color:#fff; }
+  #done { position:absolute; inset:0; display:flex; flex-direction:column; align-items:center;
+    justify-content:center; gap:20px; background:var(--bg); text-align:center; }
+
+  /* ---------- guest ---------- */
+  #guest { min-height:100%; display:flex; flex-direction:column; align-items:center; justify-content:center;
+    gap:18px; padding:28px; text-align:center; max-width:440px; margin:0 auto; }
+  #guest h1 { margin:0; font-size:30px; }
+  #guest input[type=text] { width:100%; font:inherit; padding:14px 16px; border-radius:14px;
+    border:1px solid #333; background:var(--card); color:var(--fg); }
+  #pick { width:100%; aspect-ratio:1; border:2px dashed #444; border-radius:20px; display:flex;
+    align-items:center; justify-content:center; overflow:hidden; color:var(--muted); cursor:pointer; background:var(--card); }
+  #pick img { width:100%; height:100%; object-fit:cover; }
+  #gmsg { color:var(--muted); min-height:1.4em; }
+  #gmsg.ok { color:#7ee2a0; } #gmsg.err { color:#ff8a80; }
+</style>
+</head>
+<body>
+
+<!-- HOST: lobby -->
+<section id="lobby" class="hidden">
+  <h1>📸 Scan to add your photo</h1>
+  <p>One photo each. It'll show up on the big screen.</p>
+  <div id="qr"></div>
+  <div id="count"><b>0</b> photos in</div>
+  <div id="thumbs"></div>
+  <div class="row">
+    <button id="startBtn" disabled>Start</button>
+  </div>
+  <div id="status">Connecting…</div>
+</section>
+
+<!-- HOST: slideshow -->
+<section id="show" class="hidden">
+  <img id="bgblur" alt="">
+  <img id="photo" alt="">
+  <div id="progress"></div>
+  <div id="caption" class="hidden"></div>
+  <div id="timer">
+    <svg viewBox="0 0 100 100">
+      <circle cx="50" cy="50" r="44" fill="rgba(0,0,0,.5)" stroke="rgba(255,255,255,.2)" stroke-width="8"/>
+      <circle id="ring" cx="50" cy="50" r="44" fill="none" stroke="#ffb347" stroke-width="8"
+        stroke-linecap="round" stroke-dasharray="276.46" stroke-dashoffset="0"/>
+    </svg>
+    <div class="num" id="secs">30</div>
+  </div>
+  <div id="controls">
+    <button id="pauseBtn">Pause</button>
+    <button id="nextBtn">Next ›</button>
+    <button id="lobbyBtn">QR</button>
+  </div>
+  <div id="done" class="hidden">
+    <h1>That's everyone! 🎉</h1>
+    <div class="row">
+      <button id="againBtn">Play again</button>
+      <button id="backBtn" class="ghost">Back to QR</button>
+    </div>
+  </div>
+</section>
+
+<!-- GUEST -->
+<section id="guest" class="hidden">
+  <h1>📸 Add your photo</h1>
+  <input id="gname" type="text" placeholder="Your name (optional)" maxlength="40">
+  <label id="pick"><span>Tap to choose a photo</span>
+    <input id="gfile" type="file" accept="image/*" class="hidden">
+  </label>
+  <button id="sendBtn" disabled>Send to the screen</button>
+  <div id="gmsg"></div>
+</section>
+
+<script>
+const SECONDS = 30;
+const PREFIX = "photoparty-";
+const params = new URLSearchParams(location.search);
+const joinId = params.get("join");
+const $ = id => document.getElementById(id);
+const store = {
+  get(k){ try { return localStorage.getItem(k); } catch(e){ return null; } },
+  set(k,v){ try { localStorage.setItem(k,v); } catch(e){} }
+};
+const rid = n => Array.from(crypto.getRandomValues(new Uint8Array(n)), b => "abcdefghjkmnpqrstuvwxyz23456789"[b%31]).join("");
+
+joinId ? guestMode(joinId) : hostMode();
+
+/* ===================== HOST ===================== */
+function hostMode(){
+  $("lobby").classList.remove("hidden");
+  // Keep the same room id across reloads so the QR stays valid.
+  let roomId = store.get("pp-room");
+  if (!roomId) { roomId = rid(8); store.set("pp-room", roomId); }
+
+  const photos = new Map();      // guestId -> {url, name}
+  let queue = [], shown = new Set(), idx = 0;
+  let current = null, remaining = SECONDS, tick = null, paused = false, running = false;
+  let wakeLock = null;
+
+  const base = location.href.split("?")[0].split("#")[0];
+  const joinUrl = base + "?join=" + roomId;
+  new QRCode($("qr"), { text: joinUrl, width: 512, height: 512, correctLevel: QRCode.CorrectLevel.M });
+
+  let peer;
+  function connect(){
+    peer = new Peer(PREFIX + roomId);
+    peer.on("open", () => { $("status").textContent = "Ready · room " + roomId; });
+    peer.on("connection", conn => {
+      conn.on("data", msg => {
+        if (!msg || msg.type !== "photo" || !msg.data) return;
+        const blob = new Blob([msg.data], { type: msg.mime || "image/jpeg" });
+        const prev = photos.get(msg.guestId);
+        if (prev) URL.revokeObjectURL(prev.url);
+        photos.set(msg.guestId, { url: URL.createObjectURL(blob), name: (msg.name||"").slice(0,40) });
+        // If the show is running and this is a new/replaced photo not yet shown, queue it.
+        if (running && !shown.has(msg.guestId) && !queue.slice(idx).includes(msg.guestId)) {
+          const pos = idx + 1 + Math.floor(Math.random() * (queue.length - idx));
+          queue.splice(Math.min(pos, queue.length), 0, msg.guestId);
+          if (!$("done").classList.contains("hidden")) { $("done").classList.add("hidden"); showNext(); }
+        }
+        refreshLobby(); updateProgress();
+        conn.send({ type: "ack", replaced: !!prev });
+      });
+    });
+    peer.on("disconnected", () => { $("status").textContent = "Reconnecting…"; setTimeout(() => peer.reconnect(), 1000); });
+    peer.on("error", err => {
+      if (err.type === "unavailable-id") {
+        // Old tab still holds the id; wait and retry.
+        $("status").textContent = "Room busy — retrying…";
+        setTimeout(() => { peer.destroy(); connect(); }, 4000);
+      } else {
+        $("status").textContent = "Connection issue: " + err.type + " (retrying)";
+        if (["network","server-error","socket-error","socket-closed"].includes(err.type)) {
+          setTimeout(() => { peer.destroy(); connect(); }, 3000);
+        }
+      }
+    });
+  }
+  connect();
+
+  function refreshLobby(){
+    $("count").innerHTML = "<b>" + photos.size + "</b> photo" + (photos.size===1?"":"s") + " in";
+    $("thumbs").innerHTML = "";
+    for (const p of photos.values()) { const i = new Image(); i.src = p.url; $("thumbs").appendChild(i); }
+    $("startBtn").disabled = photos.size === 0;
+    $("startBtn").textContent = running ? "Resume show" : "Start";
+  }
+
+  function shuffle(a){ for (let i=a.length-1;i>0;i--){ const j=Math.floor(Math.random()*(i+1)); [a[i],a[j]]=[a[j],a[i]]; } return a; }
+
+  async function enterShow(){
+    $("lobby").classList.add("hidden");
+    $("show").classList.remove("hidden");
+    try { await document.documentElement.requestFullscreen?.(); } catch(e){}
+    try { wakeLock = await navigator.wakeLock?.request("screen"); } catch(e){}
+  }
+
+  function startShow(){
+    queue = shuffle([...photos.keys()]); shown = new Set(); idx = 0; running = true; paused = false;
+    $("pauseBtn").textContent = "Pause";
+    $("done").classList.add("hidden");
+    showAt(0);
+  }
+
+  function showAt(i){
+    clearInterval(tick);
+    // skip any entries whose photo has gone missing
+    while (i < queue.length && !photos.has(queue[i])) i++;
+    idx = i;
+    if (idx >= queue.length) { $("done").classList.remove("hidden"); return; }
+    current = queue[idx]; shown.add(current);
+    const p = photos.get(current);
+    $("photo").src = p.url; $("bgblur").src = p.url;
+    $("caption").textContent = p.name ? "📷 " + p.name : "";
+    $("caption").classList.toggle("hidden", !p.name);
+    remaining = SECONDS; renderTimer(); updateProgress();
+    tick = setInterval(() => {
+      if (paused) return;
+      remaining -= 1; renderTimer();
+      if (remaining <= 0) showNext();
+    }, 1000);
+  }
+  function showNext(){ showAt(idx + 1); }
+
+  function renderTimer(){
+    $("secs").textContent = Math.max(0, remaining);
+    const C = 276.46;
+    $("ring").style.strokeDashoffset = C * (1 - remaining / SECONDS);
+    $("ring").style.stroke = remaining <= 5 ? "#ff6b6b" : "#ffb347";
+  }
+  function updateProgress(){
+    if (!running) return;
+    $("progress").textContent = Math.min(idx + 1, queue.length) + " / " + queue.length;
+  }
+
+  $("startBtn").onclick = async () => { await enterShow(); if (!running) startShow(); else { paused = false; $("pauseBtn").textContent="Pause"; } };
+  $("nextBtn").onclick = () => showNext();
+  $("pauseBtn").onclick = () => { paused = !paused; $("pauseBtn").textContent = paused ? "Resume" : "Pause"; };
+  $("lobbyBtn").onclick = () => { paused = true; $("pauseBtn").textContent="Resume"; $("show").classList.add("hidden"); $("lobby").classList.remove("hidden"); refreshLobby(); };
+  $("againBtn").onclick = () => startShow();
+  $("backBtn").onclick = () => { running = false; clearInterval(tick); $("show").classList.add("hidden"); $("lobby").classList.remove("hidden"); refreshLobby(); };
+  document.addEventListener("keydown", e => {
+    if ($("show").classList.contains("hidden")) return;
+    if (e.key === "ArrowRight") showNext();
+    if (e.key === " ") $("pauseBtn").click();
+  });
+  document.addEventListener("visibilitychange", async () => {
+    if (document.visibilityState === "visible" && running) {
+      try { wakeLock = await navigator.wakeLock?.request("screen"); } catch(e){}
+    }
+  });
+}
+
+/* ===================== GUEST ===================== */
+function guestMode(roomId){
+  $("guest").classList.remove("hidden");
+  let guestId = store.get("pp-guest");
+  if (!guestId) { guestId = rid(10); store.set("pp-guest", guestId); }
+  $("gname").value = store.get("pp-name") || "";
+  if (store.get("pp-sent-" + roomId)) msg("You've already sent one — sending again will replace it.", "");
+
+  let jpeg = null;
+  $("gfile").onchange = async e => {
+    const f = e.target.files[0]; if (!f) return;
+    msg("Preparing…", "");
+    try {
+      jpeg = await compress(f);
+      const url = URL.createObjectURL(jpeg);
+      $("pick").innerHTML = ""; const im = new Image(); im.src = url; $("pick").appendChild(im);
+      $("pick").appendChild($("gfile"));
+      $("sendBtn").disabled = false; msg("", "");
+    } catch(err) { msg("Couldn't read that image — try another one.", "err"); }
+  };
+
+  $("sendBtn").onclick = () => {
+    if (!jpeg) return;
+    $("sendBtn").disabled = true; msg("Sending…", "");
+    const name = $("gname").value.trim(); store.set("pp-name", name);
+    const peer = new Peer();
+    let finished = false;
+    const fail = (t) => { if (finished) return; finished = true; msg(t, "err"); $("sendBtn").disabled = false; try{peer.destroy();}catch(e){} };
+    const timer = setTimeout(() => fail("Couldn't reach the screen. Check your connection and try again (or switch Wi-Fi ↔ mobile data)."), 20000);
+    peer.on("error", err => { clearTimeout(timer); fail(err.type === "peer-unavailable" ? "The screen isn't online right now — ask the host, then try again." : "Connection problem (" + err.type + "). Try again."); });
+    peer.on("open", async () => {
+      const conn = peer.connect(PREFIX + roomId, { reliable: true });
+      conn.on("open", async () => {
+        conn.send({ type: "photo", guestId, name, mime: "image/jpeg", data: await jpeg.arrayBuffer() });
+      });
+      conn.on("data", d => {
+        if (d && d.type === "ack") {
+          clearTimeout(timer); finished = true;
+          store.set("pp-sent-" + roomId, "1");
+          msg(d.replaced ? "✅ Replaced! Watch the screen." : "✅ Sent! Watch the screen.", "ok");
+          $("sendBtn").textContent = "Replace my photo";
+          $("sendBtn").disabled = false;
+          setTimeout(() => { try { peer.destroy(); } catch(e){} }, 1500);
+        }
+      });
+    });
+  };
+
+  function msg(t, cls){ $("gmsg").textContent = t; $("gmsg").className = cls; }
+
+  async function compress(file){
+    const MAX = 1920;
+    let bmp;
+    try { bmp = await createImageBitmap(file, { imageOrientation: "from-image" }); }
+    catch(e) {
+      bmp = await new Promise((res, rej) => { const i = new Image(); i.onload = () => res(i); i.onerror = rej; i.src = URL.createObjectURL(file); });
+    }
+    const w = bmp.width, h = bmp.height, s = Math.min(1, MAX / Math.max(w, h));
+    const c = document.createElement("canvas"); c.width = Math.round(w*s); c.height = Math.round(h*s);
+    c.getContext("2d").drawImage(bmp, 0, 0, c.width, c.height);
+    return await new Promise((res, rej) => c.toBlob(b => b ? res(b) : rej(), "image/jpeg", 0.82));
+  }
+}
+</script>
+</body>
+</html>
