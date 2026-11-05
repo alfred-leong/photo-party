@@ -271,8 +271,9 @@ function guestMode(roomId){
     try {
       jpeg = await compress(f);
       const url = URL.createObjectURL(jpeg);
-      $("pick").innerHTML = ""; const im = new Image(); im.src = url; $("pick").appendChild(im);
-      $("pick").appendChild($("gfile"));
+      const fileInput = $("gfile");
+      $("pick").replaceChildren(fileInput);
+      const im = new Image(); im.src = url; $("pick").appendChild(im);
       $("sendBtn").disabled = false; msg("", "");
     } catch(err) { msg("Couldn't read that image — try another one.", "err"); }
   };
