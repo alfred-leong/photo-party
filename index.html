@@ -6,6 +6,7 @@
 <title>Photo Party</title>
 <script src="https://cdn.jsdelivr.net/npm/peerjs@1.5.4/dist/peerjs.min.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/qrcodejs@1.0.0/qrcode.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/mqtt@5.10.1/dist/mqtt.min.js"></script>
 <style>
   :root { --bg:#111014; --fg:#f5f2ea; --muted:#9a95a3; --accent:#ffb347; --card:#1d1b22; }
   * { box-sizing:border-box; }
@@ -55,7 +56,7 @@
   #guest h1 { margin:0; font-size:30px; }
   #guest input[type=text] { width:100%; font:inherit; padding:14px 16px; border-radius:14px;
     border:1px solid #333; background:var(--card); color:var(--fg); }
-  #pick { width:100%; aspect-ratio:1; border:2px dashed #444; border-radius:20px; display:flex;
+  #pick { position:relative; width:100%; aspect-ratio:1; border:2px dashed #444; border-radius:20px; display:flex;
     align-items:center; justify-content:center; overflow:hidden; color:var(--muted); cursor:pointer; background:var(--card); }
   #pick img { width:100%; height:100%; object-fit:cover; }
   #gmsg { color:var(--muted); min-height:1.4em; }
@@ -110,7 +111,7 @@
   <h1>📸 Add your photo</h1>
   <input id="gname" type="text" placeholder="Your name (optional)" maxlength="40">
   <label id="pick"><span>Tap to choose a photo</span>
-    <input id="gfile" type="file" accept="image/*" class="hidden">
+    <input id="gfile" type="file" accept="image/*" style="position:absolute;width:1px;height:1px;opacity:0;pointer-events:none">
   </label>
   <button id="sendBtn" disabled>Send to the screen</button>
   <div id="gmsg"></div>
@@ -128,6 +129,26 @@ const store = {
 };
 const rid = n => Array.from(crypto.getRandomValues(new Uint8Array(n)), b => "abcdefghjkmnpqrstuvwxyz23456789"[b%31]).join("");
 
+// ---- relay helpers (public MQTT brokers; payloads are AES-GCM encrypted with the room key from the QR) ----
+const BROKERS = ["wss://broker.emqx.io:8084/mqtt", "wss://broker.hivemq.com:8884/mqtt"];
+const topicUp  = room => "photoparty-v1/" + room + "/up";
+const topicAck = (room, id) => "photoparty-v1/" + room + "/ack/" + id;
+async function aesKey(secret){
+  const h = await crypto.subtle.digest("SHA-256", new TextEncoder().encode("photoparty:" + secret));
+  return crypto.subtle.importKey("raw", h, "AES-GCM", false, ["encrypt","decrypt"]);
+}
+async function encrypt(secret, bytes){
+  const iv = crypto.getRandomValues(new Uint8Array(12));
+  const ct = new Uint8Array(await crypto.subtle.encrypt({ name:"AES-GCM", iv }, await aesKey(secret), bytes));
+  const out = new Uint8Array(12 + ct.length); out.set(iv); out.set(ct, 12); return out;
+}
+async function decrypt(secret, sealed){
+  const pt = await crypto.subtle.decrypt({ name:"AES-GCM", iv: sealed.subarray(0,12) }, await aesKey(secret), sealed.subarray(12));
+  return new Uint8Array(pt);
+}
+function bytesToB64(u8){ let s = ""; for (let i = 0; i < u8.length; i += 0x8000) s += String.fromCharCode.apply(null, u8.subarray(i, i + 0x8000)); return btoa(s); }
+function b64ToBytes(b){ const s = atob(b); const u = new Uint8Array(s.length); for (let i = 0; i < s.length; i++) u[i] = s.charCodeAt(i); return u; }
+
 joinId ? guestMode(joinId) : hostMode();
 
 /* ===================== HOST ===================== */
@@ -142,46 +163,93 @@ function hostMode(){
   let current = null, remaining = SECONDS, tick = null, paused = false, running = false;
   let wakeLock = null;
 
+  let roomKey = store.get("pp-key");
+  if (!roomKey) { roomKey = rid(20); store.set("pp-key", roomKey); }
+
   const base = location.href.split("?")[0].split("#")[0];
-  const joinUrl = base + "?join=" + roomId;
+  const joinUrl = base + "?join=" + roomId + "&k=" + roomKey;
   new QRCode($("qr"), { text: joinUrl, width: 512, height: 512, correctLevel: QRCode.CorrectLevel.M });
 
+  // Status line: one entry per route.
+  const routes = { direct: "connecting", relay: "connecting" };
+  function renderStatus(){
+    const ok = Object.values(routes).filter(v => v === "ok").length;
+    $("status").textContent = (ok ? "Ready" : "Connecting…") + " · room " + roomId +
+      " · direct " + (routes.direct === "ok" ? "✓" : "…") + " · relay " + (routes.relay === "ok" ? "✓" : "…");
+  }
+  renderStatus();
+
+  function receivePhoto(guestId, name, mime, bytes){
+    const blob = new Blob([bytes], { type: mime || "image/jpeg" });
+    const prev = photos.get(guestId);
+    if (prev) URL.revokeObjectURL(prev.url);
+    photos.set(guestId, { url: URL.createObjectURL(blob), name: (name||"").slice(0,40) });
+    // If the show is running and this is a new/replaced photo not yet shown, queue it.
+    if (running && !shown.has(guestId) && !queue.slice(idx).includes(guestId)) {
+      const pos = idx + 1 + Math.floor(Math.random() * (queue.length - idx));
+      queue.splice(Math.min(pos, queue.length), 0, guestId);
+      if (!$("done").classList.contains("hidden")) { $("done").classList.add("hidden"); showAt(queue.indexOf(guestId)); }
+    }
+    refreshLobby(); updateProgress();
+    return !!prev;
+  }
+
+  // ---- Route 1: direct (PeerJS / WebRTC) ----
   let peer;
   function connect(){
     peer = new Peer(PREFIX + roomId);
-    peer.on("open", () => { $("status").textContent = "Ready · room " + roomId; });
+    peer.on("open", () => { routes.direct = "ok"; renderStatus(); });
     peer.on("connection", conn => {
       conn.on("data", msg => {
         if (!msg || msg.type !== "photo" || !msg.data) return;
-        const blob = new Blob([msg.data], { type: msg.mime || "image/jpeg" });
-        const prev = photos.get(msg.guestId);
-        if (prev) URL.revokeObjectURL(prev.url);
-        photos.set(msg.guestId, { url: URL.createObjectURL(blob), name: (msg.name||"").slice(0,40) });
-        // If the show is running and this is a new/replaced photo not yet shown, queue it.
-        if (running && !shown.has(msg.guestId) && !queue.slice(idx).includes(msg.guestId)) {
-          const pos = idx + 1 + Math.floor(Math.random() * (queue.length - idx));
-          queue.splice(Math.min(pos, queue.length), 0, msg.guestId);
-          if (!$("done").classList.contains("hidden")) { $("done").classList.add("hidden"); showAt(queue.indexOf(msg.guestId)); }
-        }
-        refreshLobby(); updateProgress();
-        conn.send({ type: "ack", replaced: !!prev });
+        const replaced = receivePhoto(msg.guestId, msg.name, msg.mime, msg.data);
+        conn.send({ type: "ack", replaced });
       });
     });
-    peer.on("disconnected", () => { $("status").textContent = "Reconnecting…"; setTimeout(() => peer.reconnect(), 1000); });
+    peer.on("disconnected", () => { routes.direct = "down"; renderStatus(); setTimeout(() => { try { peer.reconnect(); } catch(e){} }, 1000); });
     peer.on("error", err => {
-      if (err.type === "unavailable-id") {
-        // Old tab still holds the id; wait and retry.
-        $("status").textContent = "Room busy — retrying…";
-        setTimeout(() => { peer.destroy(); connect(); }, 4000);
-      } else {
-        $("status").textContent = "Connection issue: " + err.type + " (retrying)";
-        if (["network","server-error","socket-error","socket-closed"].includes(err.type)) {
-          setTimeout(() => { peer.destroy(); connect(); }, 3000);
-        }
-      }
+      if (err.type === "peer-unavailable") return;          // irrelevant on host
+      routes.direct = "down"; renderStatus();
+      const wait = err.type === "unavailable-id" ? 4000 : 3000;  // old tab may still hold the id
+      setTimeout(() => { try { peer.destroy(); } catch(e){} connect(); }, wait);
     });
   }
-  connect();
+  try { connect(); } catch(e) { routes.direct = "down"; renderStatus(); }
+
+  // ---- Route 2: relay (MQTT over WebSocket, end-to-end encrypted with roomKey) ----
+  const partial = new Map();   // msgId -> {n, parts: []}
+  const relayUp = new Set();
+  BROKERS.forEach(url => {
+    if (!window.mqtt) return;
+    const client = mqtt.connect(url, { clientId: "pph-" + rid(10), clean: true, connectTimeout: 8000, reconnectPeriod: 3000, keepalive: 30 });
+    client.on("connect", () => {
+      client.subscribe(topicUp(roomId), { qos: 1 });
+      relayUp.add(url); routes.relay = "ok"; renderStatus();
+    });
+    client.on("close", () => {
+      relayUp.delete(url); routes.relay = relayUp.size ? "ok" : "down"; renderStatus();
+    });
+    client.on("message", async (topic, payload) => {
+      try {
+        const m = JSON.parse(new TextDecoder().decode(payload));
+        if (!m.id || typeof m.i !== "number") return;
+        let e = partial.get(m.id);
+        if (!e) { e = { n: m.n, parts: new Array(m.n), got: 0, t: Date.now() }; partial.set(m.id, e); }
+        if (e.parts[m.i] === undefined) { e.parts[m.i] = m.d; e.got++; }
+        if (e.got < e.n) return;
+        partial.delete(m.id);
+        const sealed = b64ToBytes(e.parts.join(""));
+        const plain = await decrypt(roomKey, sealed);
+        const hlen = new DataView(plain.buffer, plain.byteOffset).getUint32(0);
+        const head = JSON.parse(new TextDecoder().decode(plain.subarray(4, 4 + hlen)));
+        const img = plain.slice(4 + hlen);
+        const replaced = receivePhoto(head.guestId, head.name, head.mime, img);
+        client.publish(topicAck(roomId, m.id), replaced ? "r" : "n", { qos: 1 });
+      } catch(err) { console.warn("relay message dropped", err); }
+    });
+    // Drop half-received uploads after 2 minutes.
+    setInterval(() => { const now = Date.now(); for (const [k,v] of partial) if (now - v.t > 120000) partial.delete(k); }, 30000);
+  });
 
   function refreshLobby(){
     $("count").innerHTML = "<b>" + photos.size + "</b> photo" + (photos.size===1?"":"s") + " in";
@@ -280,37 +348,95 @@ function guestMode(roomId){
     } catch(err) { msg("Couldn't read that image — try another one.", "err"); }
   };
 
-  $("sendBtn").onclick = () => {
+  const roomKey = params.get("k");
+  const forceRoute = params.get("route");   // debug: "direct" or "relay"
+
+  $("sendBtn").onclick = async () => {
     if (!jpeg) return;
     $("sendBtn").disabled = true; msg("Sending…", "");
     const name = $("gname").value.trim(); store.set("pp-name", name);
-    const peer = new Peer();
-    let finished = false;
-    const fail = (t) => { if (finished) return; finished = true; msg(t, "err"); $("sendBtn").disabled = false; try{peer.destroy();}catch(e){} };
-    const timer = setTimeout(() => fail("Couldn't reach the screen. Check your connection and try again (or switch Wi-Fi ↔ mobile data)."), 20000);
-    peer.on("error", err => { clearTimeout(timer); fail(err.type === "peer-unavailable" ? "The screen isn't online right now — ask the host, then try again." : "Connection problem (" + err.type + "). Try again."); });
-    peer.on("open", async () => {
-      const conn = peer.connect(PREFIX + roomId, { reliable: true });
-      conn.on("open", async () => {
-        conn.send({ type: "photo", guestId, name, mime: "image/jpeg", data: await jpeg.arrayBuffer() });
-      });
-      conn.on("data", d => {
-        if (d && d.type === "ack") {
-          clearTimeout(timer); finished = true;
-          store.set("pp-sent-" + roomId, "1");
-          msg(d.replaced ? "✅ Replaced! Watch the screen." : "✅ Sent! Watch the screen.", "ok");
-          $("sendBtn").textContent = "Replace my photo";
-          $("sendBtn").disabled = false;
-          setTimeout(() => { try { peer.destroy(); } catch(e){} }, 1500);
-        }
+    const bytes = new Uint8Array(await jpeg.arrayBuffer());
+    const errors = [];
+    let result = null;
+
+    if (forceRoute !== "relay") {
+      try { result = await sendDirect(name, bytes); }
+      catch(e) { errors.push("direct: " + e.message); console.warn(e); }
+    }
+    if (!result && roomKey && forceRoute !== "direct") {
+      msg("Trying another route…", "");
+      try { result = await sendRelay(name, bytes); }
+      catch(e) { errors.push("relay: " + e.message); console.warn(e); }
+    }
+
+    $("sendBtn").disabled = false;
+    if (result) {
+      store.set("pp-sent-" + roomId, "1");
+      msg(result.replaced ? "✅ Replaced! Watch the screen." : "✅ Sent! Watch the screen.", "ok");
+      $("sendBtn").textContent = "Replace my photo";
+    } else {
+      const offline = errors.some(e => e.includes("screen-offline"));
+      msg(offline
+        ? "The screen isn't online right now — ask the host to check, then try again."
+        : "Couldn't reach the screen. Try again, or switch between Wi-Fi and mobile data. (" + errors.join("; ") + ")", "err");
+    }
+  };
+
+  // Route 1: direct WebRTC via PeerJS. Resolves {replaced} or rejects.
+  function sendDirect(name, bytes){
+    return new Promise((resolve, reject) => {
+      let peer, done = false;
+      const end = (err, val) => { if (done) return; done = true; clearTimeout(t); setTimeout(() => { try { peer && peer.destroy(); } catch(e){} }, 1000); err ? reject(err) : resolve(val); };
+      const t = setTimeout(() => end(new Error("timeout")), 12000);
+      try { peer = new Peer(); } catch(e) { return end(new Error("unavailable")); }
+      peer.on("error", err => end(new Error(err.type === "peer-unavailable" ? "screen-offline" : err.type)));
+      peer.on("open", () => {
+        const conn = peer.connect(PREFIX + roomId, { reliable: true });
+        conn.on("open", () => conn.send({ type: "photo", guestId, name, mime: "image/jpeg", data: bytes.buffer }));
+        conn.on("data", d => { if (d && d.type === "ack") end(null, { replaced: !!d.replaced }); });
+        conn.on("error", () => end(new Error("channel")));
       });
     });
-  };
+  }
+
+  // Route 2: encrypted upload through a public MQTT relay. Tries each broker in turn.
+  async function sendRelay(name, bytes){
+    if (!window.mqtt) throw new Error("relay library didn't load");
+    const head = new TextEncoder().encode(JSON.stringify({ guestId, name, mime: "image/jpeg" }));
+    const plain = new Uint8Array(4 + head.length + bytes.length);
+    new DataView(plain.buffer).setUint32(0, head.length); plain.set(head, 4); plain.set(bytes, 4 + head.length);
+    const b64 = bytesToB64(await encrypt(roomKey, plain));
+    const CH = 48000, n = Math.ceil(b64.length / CH), id = rid(12);
+    let lastErr = new Error("no relay");
+    for (const url of BROKERS) {
+      try { return await viaBroker(url, id, b64, CH, n); }
+      catch(e) { lastErr = e; }
+    }
+    throw lastErr;
+  }
+  function viaBroker(url, id, b64, CH, n){
+    return new Promise((resolve, reject) => {
+      let done = false;
+      const client = mqtt.connect(url, { clientId: "ppg-" + rid(10), clean: true, connectTimeout: 7000, reconnectPeriod: 0 });
+      const end = (err, val) => { if (done) return; done = true; clearTimeout(t); try { client.end(true); } catch(e){} err ? reject(err) : resolve(val); };
+      const t = setTimeout(() => end(new Error("no answer from screen")), 25000);
+      client.on("error", e => end(new Error("relay error")));
+      client.on("message", (topic, payload) => end(null, { replaced: new TextDecoder().decode(payload) === "r" }));
+      client.on("connect", () => {
+        client.subscribe(topicAck(roomId, id), { qos: 1 }, err => {
+          if (err) return end(new Error("relay subscribe"));
+          for (let i = 0; i < n; i++) {
+            client.publish(topicUp(roomId), JSON.stringify({ id, i, n, d: b64.slice(i*CH, (i+1)*CH) }), { qos: 1 });
+          }
+        });
+      });
+    });
+  }
 
   function msg(t, cls){ $("gmsg").textContent = t; $("gmsg").className = cls; }
 
   async function compress(file){
-    const MAX = 1920;
+    const MAX = 1600;
     let bmp;
     try { bmp = await createImageBitmap(file, { imageOrientation: "from-image" }); }
     catch(e) {
