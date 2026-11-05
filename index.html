@@ -193,11 +193,15 @@ function hostMode(){
 
   function shuffle(a){ for (let i=a.length-1;i>0;i--){ const j=Math.floor(Math.random()*(i+1)); [a[i],a[j]]=[a[j],a[i]]; } return a; }
 
-  async function enterShow(){
+  function enterShow(){
     $("lobby").classList.add("hidden");
     $("show").classList.remove("hidden");
-    try { await document.documentElement.requestFullscreen?.(); } catch(e){}
-    try { wakeLock = await navigator.wakeLock?.request("screen"); } catch(e){}
+    // Fire-and-forget: some browsers never settle these promises, so never block the show on them.
+    try { document.documentElement.requestFullscreen?.()?.catch(() => {}); } catch(e){}
+    requestWake();
+  }
+  function requestWake(){
+    try { navigator.wakeLock?.request("screen").then(l => { wakeLock = l; }).catch(() => {}); } catch(e){}
   }
 
   function startShow(){
@@ -238,7 +242,7 @@ function hostMode(){
     $("progress").textContent = Math.min(idx + 1, queue.length) + " / " + queue.length;
   }
 
-  $("startBtn").onclick = async () => { await enterShow(); if (!running) startShow(); else { paused = false; $("pauseBtn").textContent="Pause"; } };
+  $("startBtn").onclick = () => { enterShow(); if (!running) startShow(); else { paused = false; $("pauseBtn").textContent="Pause"; } };
   $("nextBtn").onclick = () => showNext();
   $("pauseBtn").onclick = () => { paused = !paused; $("pauseBtn").textContent = paused ? "Resume" : "Pause"; };
   $("lobbyBtn").onclick = () => { paused = true; $("pauseBtn").textContent="Resume"; $("show").classList.add("hidden"); $("lobby").classList.remove("hidden"); refreshLobby(); };
@@ -249,10 +253,8 @@ function hostMode(){
     if (e.key === "ArrowRight") showNext();
     if (e.key === " ") $("pauseBtn").click();
   });
-  document.addEventListener("visibilitychange", async () => {
-    if (document.visibilityState === "visible" && running) {
-      try { wakeLock = await navigator.wakeLock?.request("screen"); } catch(e){}
-    }
+  document.addEventListener("visibilitychange", () => {
+    if (document.visibilityState === "visible" && running) requestWake();
   });
 }
 
